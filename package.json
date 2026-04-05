@@ -1,0 +1,26 @@
+{
+  "name": "ai-video-factory-gpu-render-node",
+  "version": "1.0.0",
+  "description": "GPU-enabled render node + visual dashboard for AI Video Factory",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node app.mjs",
+    "doctor": "node scripts/doctor.mjs"
+  },
+  "dependencies": {
+    "@remotion/bundler": "^4.0.443",
+    "@remotion/google-fonts": "^4.0.445",
+    "@remotion/layout-utils": "^4.0.445",
+    "@remotion/light-leaks": "^4.0.445",
+    "@remotion/media-utils": "^4.0.445",
+    "@remotion/paths": "^4.0.445",
+    "@remotion/renderer": "^4.0.443",
+    "@remotion/transitions": "^4.0.443",
+    "express": "^4.18.2",
+    "ws": "^8.14.2"
+  },
+  "optionalDependencies": {
+    "replicate": '*'
+  }
+}
