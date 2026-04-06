@@ -30,13 +30,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ─── Config from env ──────────────────────────────────────────────────────────
 
-const WORKSPACE_ROOT   = process.env.WORKSPACE_ROOT    || '/data/.openclaw/workspace';
+const API_MODE        = process.env.API_MODE === 'true';
+const API_URL         = process.env.API_URL         || '';   // e.g. http://187.124.2.245:43988
+const API_TOKEN       = process.env.API_TOKEN       || '';
+const WORKSPACE_ROOT   = process.env.WORKSPACE_ROOT  || '/data/.openclaw/workspace';
 const RENDER_WORKER_ROOT = process.env.REMOTION_PROJECT_ROOT || path.join(WORKSPACE_ROOT, 'systems/ai-video-factory/render-worker');
-const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID  || process.env.GOOGLE_WORKSPACE_FOLDER_ID || '';
-const GDRIVE_TOKEN     = process.env.GDRIVE_TOKEN      || '';
-const PORT             = parseInt(process.env.PORT      || '3000', 10);
-const TAILNET_HOST     = process.env.TAILNET_HOST      || '127.0.0.1'; // Tailscale IP of container
-const QUEUE_WS_URL     = process.env.QUEUE_WS_URL      || `http://${TAILNET_HOST}:18789`;
+const GDRIVE_FOLDER_ID = process.env.GDRIVE_FOLDER_ID || process.env.GOOGLE_WORKSPACE_FOLDER_ID || '';
+const GDRIVE_TOKEN     = process.env.GDRIVE_TOKEN   || '';
+const PORT            = parseInt(process.env.PORT  || '3000', 10);
+const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '3000');
 
 // ─── Derived paths ────────────────────────────────────────────────────────────
 
@@ -360,36 +362,165 @@ async function processJob(workingPath) {
   }
 }
 
-// ─── Queue Scanner ─────────────────────────────────────────────────────────────
+// ─── API Helpers (API_MODE) ─────────────────────────────────────────────────
 
-async function scanQueue() {
+async function apiRequest(method, path, body) {
+  const url = `${API_URL}${path}`;
+  const opts = {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${API_TOKEN}`,
+    },
+  };
+  if (body) {
+    opts.body = JSON.stringify(body);
+    opts.headers['Content-Length'] = Buffer.byteLength(opts.body);
+  }
+  const res = await fetch(url, opts);
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  if (!res.ok) throw new Error(`API ${method} ${path} → ${res.status}: ${JSON.stringify(json)}`);
+  return json;
+}
+
+async function claimJob() {
+  if (!API_MODE) return null;
   try {
-    const pending = (fs.readdirSync(QUEUE_PENDING) || [])
-      .filter(f => f.endsWith('.json'))
-      .sort();
-
-    if (!pending.length) return;
-
-    for (const file of pending) {
-      const pendingPath = path.join(QUEUE_PENDING, file);
-      const workingPath = path.join(QUEUE_WORKING, file);
-      try {
-        fs.renameSync(pendingPath, workingPath);
-      } catch {
-        continue; // already claimed by another worker
-      }
-      try {
-        await processJob(workingPath);
-      } catch (err) {
-        log(`processJob threw: ${err.message}`);
-        try {
-          const job = JSON.parse(fs.readFileSync(workingPath, 'utf8'));
-          fs.renameSync(workingPath, path.join(QUEUE_FAILED, file));
-        } catch {}
-      }
-    }
+    const r = await apiRequest('GET', '/api/render-jobs/pending');
+    if (r.pending?.length) return r.pending[0];
+    return null;
   } catch (err) {
-    log(`scanQueue error: ${err.message}`);
+    log(`claimJob error: ${err.message}`);
+    return null;
+  }
+}
+
+async function reportComplete(jobId, data) {
+  if (!API_MODE) return;
+  try {
+    await apiRequest('POST', `/api/render-jobs/${jobId}/complete`, data);
+  } catch (err) {
+    log(`reportComplete ${jobId} error: ${err.message}`);
+  }
+}
+
+async function reportFailed(jobId, errorMsg, data = {}) {
+  if (!API_MODE) return;
+  try {
+    await apiRequest('POST', `/api/render-jobs/${jobId}/failed`, { error: errorMsg, ...data });
+  } catch (err) {
+    log(`reportFailed ${jobId} error: ${err.message}`);
+  }
+}
+
+// ─── API Mode: Job Claimer ───────────────────────────────────────────────────
+
+async function apiJobLoop() {
+  log(`API mode active — polling ${API_URL} every ${POLL_INTERVAL_MS}ms`);
+  while (true) {
+    try {
+      const job = await claimJob();
+      if (job) {
+        await processApiJob(job);
+      } else {
+        await sleep(POLL_INTERVAL_MS);
+      }
+    } catch (err) {
+      log(`apiJobLoop error: ${err.message}`);
+      await sleep(POLL_INTERVAL_MS);
+    }
+  }
+}
+
+async function processApiJob(job) {
+  const jobId = job.job_id;
+  const startedAt = new Date().toISOString();
+  log(`API claimed job ${jobId}`);
+
+  jobSessions.set(jobId, {
+    jobId,
+    requestId: job.request_id,
+    status: 'rendering',
+    progress: 0,
+    rendered: null,
+    encoded: null,
+    stage: 'starting',
+    gpu: {...gpuStats},
+    startTime: startedAt,
+    outputPath: job.output_path,
+    renderPackagePath: job.render_package_path,
+  });
+  broadcast('job_start', jobSessions.get(jobId));
+
+  try {
+    const renderPkgAbs = path.isAbsolute(job.render_package_path)
+      ? job.render_package_path
+      : path.join(WORKSPACE_ROOT, job.render_package_path);
+    const outputAbs = path.isAbsolute(job.output_path)
+      ? job.output_path
+      : path.join(OUTPUTS_DIR, path.basename(job.output_path));
+    fs.mkdirSync(path.dirname(outputAbs), {recursive: true});
+
+    await runRender(jobId, renderPkgAbs, outputAbs, ({progress, rendered, encoded, stage}) => {
+      jobSessions.set(jobId, {
+        ...(jobSessions.get(jobId) || {}),
+        status: 'rendering', progress, rendered, encoded, stage, gpu: {...gpuStats},
+      });
+      broadcast('progress', jobSessions.get(jobId));
+    });
+
+    if (!fs.existsSync(outputAbs)) throw new Error(`Output not created: ${outputAbs}`);
+
+
+    const upload = uploadToDrive(outputAbs);
+    const notification = buildNotificationPayload(job, upload);
+    const result = {
+      job_id: jobId,
+      request_id: job.request_id,
+      status: 'succeeded',
+      started_at: startedAt,
+      finished_at: new Date().toISOString(),
+      output_path: outputAbs,
+      log_path: path.join(LOGS_DIR, `${jobId}.log`),
+      render_package_path: job.render_package_path,
+      worker_runtime: 'gpu-render-node',
+      gpu: {...gpuStats},
+      upload,
+      notification,
+    };
+    persistJson(path.join(RESULTS_DIR, `${jobId}.json`), result);
+    const sidecarMeta = (kind) => { const p = path.parse(outputAbs); return path.join(p.dir, `${p.name}.${kind}.json`); };
+    persistJson(sidecarMeta('upload'), upload);
+    persistJson(sidecarMeta('notify'), notification);
+    jobSessions.set(jobId, {...result, status: 'succeeded', progress: 100});
+    broadcast('job_done', jobSessions.get(jobId));
+    await reportComplete(jobId, {
+      request_id: job.request_id,
+      started_at: startedAt,
+      output_path: outputAbs,
+      log_path: path.join(LOGS_DIR, `${jobId}.log`),
+      render_package_path: job.render_package_path,
+      gpu: gpuStats,
+      upload,
+    });
+    log(`Job ${jobId} succeeded → ${outputAbs}`);
+  } catch (err) {
+    const result = {
+      job_id: jobId,
+      request_id: job.request_id,
+      status: 'failed',
+      finished_at: new Date().toISOString(),
+      error: err.message,
+      worker_runtime: 'gpu-render-node',
+      gpu: gpuStats,
+    };
+    persistJson(path.join(RESULTS_DIR, `${jobId}.json`), result);
+    jobSessions.set(jobId, {...result, status: 'failed'});
+    broadcast('job_failed', jobSessions.get(jobId));
+    await reportFailed(jobId, err.message, { request_id: job.request_id });
+    log(`Job ${jobId} FAILED: ${err.message}`);
   }
 }
 
@@ -494,13 +625,20 @@ const server = createServer(app);
 server.listen(PORT, '0.0.0.0', () => {
   log(`GPU Render Node running at http://localhost:${PORT}`);
   log(`Workspace: ${WORKSPACE_ROOT}`);
-  log(`Queue watch: ${QUEUE_PENDING}`);
+  if (API_MODE) {
+    log(`API mode: ${API_MODE} | API URL: ${API_URL}`);
+  } else {
+    log(`Queue watch: ${QUEUE_PENDING}`);
+  }
 });
 
 // ─── Queue loop ───────────────────────────────────────────────────────────────
 
-// Poll every 3 seconds
-setInterval(scanQueue, 3000);
+if (API_MODE) {
+  apiJobLoop();
+} else {
+  setInterval(scanQueue, POLL_INTERVAL_MS);
+}
 
 // ─── Dashboard HTML ───────────────────────────────────────────────────────────
 
